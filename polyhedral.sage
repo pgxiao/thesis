@@ -6,8 +6,9 @@ if '' not in sys.path:
     sys.path = [''] + sys.path
 from igp import *
 from sage.numerical.mip import MIPSolverException
+from collections import defaultdict
+from itertools import product
 
-import itertools
 
 ###############################
 # Polyhedral Arrangement
@@ -41,13 +42,17 @@ class PolyhedralArrangement:
             return
         self._ambient_dim = coll_dict.values()[0][0].ambient_dim()
         self._dim = max(coll_dict.keys())
+        # size is the numbers of polyhedra (not including sub-polyhedra) when set up the arrangement
         self._size = sum([len(v) for v in coll_dict.values()])
-        self._grid = Grid(self._size, self._ambient_dim)
         self._coll_dict = coll_dict
-        self._intersect_dict = {}
+        self._grid = Grid(self._size, self._ambient_dim, width=None)
+        self._buckets = defaultdict(set)
 
     def ambient_dimension(self):
         return self._ambient_dim
+
+    def buckets(self):
+        return self._buckets
 
     def collection(self):
         r"""
@@ -74,10 +79,7 @@ class PolyhedralArrangement:
         return self._grid
 
     def grid_dict(self):
-        return self.grid().grid_dict()
-
-    def intersect_dict(self):
-        return self._intersect_dict
+        return self.grid().dict()
 
     def LP_for_intersection(self, p, q):
         r"""
@@ -192,322 +194,171 @@ class PolyhedralArrangement:
         """
         return self._size
 
-    def search_polyhedron(self, p, area=None, limit=None):
+    def search_polyhedron(self, p, selection=None):
         r"""
         Search what buckets the polyhedron ``p`` located in
         and update the bucket dictionary.
-
-        EXAMPLES::
-
-            sage: p = Polyhedron(vertices=((1/4, 1/2), (1/2, 1/2), (1/4, 3/4), (1/2, 3/4)))
-            sage: PA = PolyhedralArrangement((p,))
-            sage: PA.search_polyhedron(p, limit=1/4)
-            sage: d = PA.grid_dict()
-            sage: d.keys()
-            [((0, 3/4), (0, 1), (1/4, 3/4), (1/4, 1)),
-             ((1/2, 1/4), (1/2, 1/2), (3/4, 1/4), (3/4, 1/2)),
-             ((0, 1/2), (0, 3/4), (1/4, 1/2), (1/4, 3/4)),
-             ((1/2, 3/4), (1/2, 1), (3/4, 3/4), (3/4, 1)),
-             ((1/4, 1/4), (1/4, 1/2), (1/2, 1/4), (1/2, 1/2)),
-             ((1/4, 3/4), (1/4, 1), (1/2, 3/4), (1/2, 1)),
-             ((1/2, 1/2), (1/2, 3/4), (3/4, 1/2), (3/4, 3/4)),
-             ((1/4, 1/2), (1/4, 3/4), (1/2, 1/2), (1/2, 3/4)),
-             ((0, 1/4), (0, 1/2), (1/4, 1/4), (1/4, 1/2))]
         """
-        # FIXME: need tests in k-dim
-        def hash_area(area):
-            return tuple(map(tuple, area))
         grid = self.grid()
-        if area is None:
-            area = self.grid().standard_grid()
-            area_polyhedron = self.grid().standard_grid_polyhedron()
-        else:
-            area_polyhedron = Polyhedron(vertices=area)
-        if limit is None:
-            limit = self.grid().width()
-
-        if self.LP_intersect(area_polyhedron, p):
-            edges = grid.lengths_of_edges(area)
-            if all(e <= limit for e in edges):
-                key = hash_area(area)
-                if key in grid._dict:
-                    grid._dict[key].add(p)
-                else:
-                    grid._dict[key] = set([p])
-                if p in self._intersect_dict:
-                    self._intersect_dict[p].add(key)
-                else:
-                    self._intersect_dict[p] = set()
-                    self._intersect_dict[p].add(key)
+        if selection is None:
+            size = grid.size()
+            dim = grid.dim()
+            selection = (tuple(0 for i in range(dim)), tuple(size - 1 for i in range(dim)))
+        print "searching selection", selection
+        lower_left = selection[0]
+        upper_right = selection[1]
+        if self.LP_intersect(grid.selection_to_polyhedron(lower_left, upper_right), p):
+            print "intersect"
+            print "lower_left", lower_left
+            print "upper_right", upper_right
+            if lower_left == upper_right:
+                grid._contents[lower_left].add(p)
+                self._buckets[p].add(lower_left)
             else:
-                a, b = grid.cut_grid(area)
-                self.search_polyhedron(p, a, limit)
-                self.search_polyhedron(p, b, limit)
+                print "lower_left != upper_right"
+                a, b = grid.cut_selection(lower_left, upper_right)
+                self.search_polyhedron(p, a)
+                self.search_polyhedron(p, b)
 
-    def search(self, area=None, limit=None):
+    def search(self, selection=None):
         r"""
         For each polyhedron in the collection, search which grid does
         the polyhedron located in and update the grid dictionary.
         """
         for p in self.collection():
-            self.search_polyhedron(p, area, limit)
+            self.search_polyhedron(p, selection)
 
 class Grid:
         """docstring for Grid"""
-        def __init__(self, size, dim):
+        def __init__(self, number_of_poly, dim, width=None):
             # size is the number of polyhedra
             # dim is the ambient dimension of the polyhedra
-            self._size = size
-            self._dim = dim
-            self._width = 1 / (size ^ (1 / dim))
-            self._dict = {}
-
-        def build_grid(self, low_pt, width=None):
-            r"""
-            Build a single grid by given the lowest point of grid
-            Return the vertices of the grid
-
-            EXAMPLES::
-
-                sage: g = Grid(2, 3)
-                sage: g.build_grid([0, 0, 0], 1)
-                [[0, 0, 0],
-                 [0, 0, 1],
-                 [0, 1, 0],
-                 [0, 1, 1],
-                 [1, 0, 0],
-                 [1, 0, 1],
-                 [1, 1, 0],
-                 [1, 1, 1]]
-            """
+            # FIXME: width can only be fractional
             if width is None:
-                width = self.width()
-            unit_grid_iterator = itertools.product([0, width], repeat=self.dimension())
-            unit_grid = [list(v) for v in unit_grid_iterator]
+                # self._width = 1 / (size ^ (1 / dim))
+                self._width = 1 / number_of_poly
+                # FIXME: check width types, raise error if not fractional
+            self._size = int(1 / self._width)
+            self._dim = dim
+            self._coord = [i * self._width for i in range(0, 1 + self._size)]
+            self._buckets = set(product(range(self._size), repeat=dim))
+            self._contents = defaultdict(set)
+
+        # definition of terms:
+        # 1. bucket - a single bucket in the grid with integer coordinates.
+        # 2. selection - a bounch of buckets which can be determined by 
+        #    the lower left bucket and upper right bucket.
+        #    Think of a cube that can be determined by the lower left vertex
+        #    and upper right vertex.
+
+        def buckets(self):
+            return self._buckets
+
+        def bucket_to_hypercube(self, lower_left):
+            r"""
+            Return a hypercube with standard width by giving the actual coordinates
+            of the lower left vertex of hypercube.
+            """
+            origin = self.get_coordinate(lower_left)
+            unit_grid_iter = product([0, self.width()], repeat=self.dim())
+            unit_grid = [list(v) for v in unit_grid_iter]
             v_list = [0] * len(unit_grid)
             for index, v in enumerate(unit_grid):
-                v_list[index] = [o + p for o, p in zip(v, low_pt)]
-            return v_list
+                v_list[index] = [o + p for o, p in zip(v, origin)]
+            return Polyhedron(vertices=v_list)
 
-        def build_grid_polyhedron(self, low_pt, width=None):
+        def change_coordinate(self, bucket, index, change):
+            # change one coordinate of the given bucket
+            return bucket[:index] + (bucket[index] + change,) + bucket[1 + index:]
+
+        def cut_selection(self, lower_left, upper_right):
             r"""
-            Build a single grid as a Polyhedron by given the lowest point of grid
-            Return the vertices of the grid
+            Given the lower left vertice and upper right vertice of the selection,
+            find the 'longest' part, and cut it into two equal parts.
 
-            EXAMPLES::
-
-                sage: g = Grid(2, 3)
-                sage: p = g.build_grid_polyhedron([0, 0, 0], 1)
-                sage: p.vertices()
-                (A vertex at (0, 0, 0),
-                 A vertex at (0, 0, 1),
-                 A vertex at (0, 1, 0),
-                 A vertex at (0, 1, 1),
-                 A vertex at (1, 0, 0),
-                 A vertex at (1, 0, 1),
-                 A vertex at (1, 1, 0),
-                 A vertex at (1, 1, 1))
+            Return two tuples of the lower left and upper right vertices
+            of the two buckets.
             """
-            if width is None:
-                width = self.width()
-            return Polyhedron(vertices=self.build_grid(low_pt, width))
+            if lower_left == upper_right:
+                return lower_left, lower_left
+            index, length = self.longest_edge(lower_left, upper_right)
+            change = (length + 1) // 2
+            if length % 2 == 0:
+                # odd number of buckets
+                upper_change = change + 1
+            else:
+                upper_change = change
+            # cut the bucket into two buckets
+            # assume the lower one is smaller if length is odd
+            small = (lower_left, self.change_coordinate(upper_right, index, -upper_change))
+            large = (self.change_coordinate(lower_left, index, change), upper_right)
+            return small, large
 
-        def cut_grid(self, area):
-            r"""
-            Given the vertices of the area, find the 'longest' part, and cut
-            it into two equal parts.
-
-            EXAMPLES::
-
-                sage: g = Grid(2, 3)
-                sage: v2 = [[2, 3, 4],
-                ....:  [2, 3, 9],
-                ....:  [2, 10, 4],
-                ....:  [2, 10, 9],
-                ....:  [8, 3, 4],
-                ....:  [8, 3, 9],
-                ....:  [8, 10, 4],
-                ....:  [8, 10, 9]]
-                sage: x, y = g.cut_grid(v2)
-                sage: x
-                [[2, 3, 4],
-                 [2, 3, 9],
-                 [2, 13/2, 4],
-                 [2, 13/2, 9],
-                 [8, 3, 4],
-                 [8, 3, 9],
-                 [8, 13/2, 4],
-                 [8, 13/2, 9]]
-                sage: y
-                [[2, 13/2, 4],
-                 [2, 13/2, 9],
-                 [2, 10, 4],
-                 [2, 10, 9],
-                 [8, 13/2, 4],
-                 [8, 13/2, 9],
-                 [8, 10, 4],
-                 [8, 10, 9]]
-            """
-            index, length = self.longest_edge(area)
-            a = deepcopy(area)
-            b = deepcopy(area)
-            lower = area[0][index]
-            high = area[-1][index]
-            change = (high - lower) / 2
-            for i, v in enumerate(area):
-                if v[index] == high:
-                    a[i][index] = lower + change
-                else:
-                    b[i][index] = lower + change
-            return a, b
-
-        def dimension(self):
+        def dim(self):
             return self._dim
 
-        def grid_dict(self):
-            return self._dict
+        def dict(self):
+            return self._contents
 
-        def lengths_of_edges(self, polytope):
-            r"""
-            Return a list of the lengths of a group of edges
+        def edges_of_selection(self, lower_left, upper_right):
+            return [c1 - c0 for c0, c1 in zip(lower_left, upper_right)]
 
-            EXAMPLES::
+        def get_coordinate(self, bucket):
+            # get the actual coordinate of the bucket
+            return tuple(coord * self.width() for coord in bucket)
 
-                sage: g = Grid(2, 3)
-                sage: v1 = g.build_grid([2, 3, 4], 1)
-                sage: g.lengths_of_edges(v1)
-                [1, 1, 1]
-                sage: v2 = [[2, 3, 4],
-                ....:  [2, 3, 9],
-                ....:  [2, 10, 4],
-                ....:  [2, 10, 9],
-                ....:  [8, 3, 4],
-                ....:  [8, 3, 9],
-                ....:  [8, 10, 4],
-                ....:  [8, 10, 9]]
-                sage: g.lengths_of_edges(v2)
-                [6, 7, 5]
-            """
-            dim = self.dimension()
-            lengths = [0] * dim
-            # this part look weird, but it works. The trick is to know how
-            # itertools.product construct the list in build_grid(self, low_pt)
-            for i in range(0, dim):
-                lengths[dim-i-1] = polytope[2^i][dim-i-1] - polytope[0][dim-i-1]
-            return lengths
-
-        def longest_edge(self, polytope):
-            r"""
-            Find the longest edge of the polytope and return its index and the length
-            of the longest edge.
-
-            EXAMPLES::
-
-                sage: g = Grid(1, 4)
-                sage: v1 = g.build_grid([0, 0, 0, 0], 1)
-                sage: x, y = g.cut_grid(v1)
-                sage: x
-                [[0, 0, 0, 0],
-                 [0, 0, 0, 1],
-                 [0, 0, 1, 0],
-                 [0, 0, 1, 1],
-                 [0, 1, 0, 0],
-                 [0, 1, 0, 1],
-                 [0, 1, 1, 0],
-                 [0, 1, 1, 1],
-                 [1/2, 0, 0, 0],
-                 [1/2, 0, 0, 1],
-                 [1/2, 0, 1, 0],
-                 [1/2, 0, 1, 1],
-                 [1/2, 1, 0, 0],
-                 [1/2, 1, 0, 1],
-                 [1/2, 1, 1, 0],
-                 [1/2, 1, 1, 1]]
-                sage: y
-                [[1/2, 0, 0, 0],
-                 [1/2, 0, 0, 1],
-                 [1/2, 0, 1, 0],
-                 [1/2, 0, 1, 1],
-                 [1/2, 1, 0, 0],
-                 [1/2, 1, 0, 1],
-                 [1/2, 1, 1, 0],
-                 [1/2, 1, 1, 1],
-                 [1, 0, 0, 0],
-                 [1, 0, 0, 1],
-                 [1, 0, 1, 0],
-                 [1, 0, 1, 1],
-                 [1, 1, 0, 0],
-                 [1, 1, 0, 1],
-                 [1, 1, 1, 0],
-                 [1, 1, 1, 1]]
-                sage: g = Grid(2, 3)
-                sage: v1 = g.build_grid([2, 3, 4], 1)
-                sage: g.longest_edge(v1)
-                (0, 1)
-                sage: v2 = [[2, 3, 4],
-                ....:  [2, 3, 9],
-                ....:  [2, 10, 4],
-                ....:  [2, 10, 9],
-                ....:  [8, 3, 4],
-                ....:  [8, 3, 9],
-                ....:  [8, 10, 4],
-                ....:  [8, 10, 9]]
-                sage: g.longest_edge(v2)
-                (1, 7)
-            """
-            lengths = self.lengths_of_edges(polytope)
-            m = max(lengths)
-            index = lengths.index(m)
+        def longest_edge(self, lower_left, upper_right):
+            edges = self.edges_of_selection(lower_left, upper_right)
+            m = max(edges)
+            index = edges.index(m)
             return index, m
+
+        def selection_to_polyhedron(self, lower_left, upper_right):
+            r'''
+            EXAMPLES::
+
+                sage: g = Grid(3, 3)
+                sage: # build a flat box 
+                sage: # (i.e. the height is half of the width or of the length)
+                sage: p = g.selection_to_polyhedron((1, 1, 2), (2, 2, 2))
+                sage: p.vertices()
+                (A vertex at (1, 1, 1),
+                 A vertex at (1/3, 1/3, 2/3),
+                 A vertex at (1/3, 1/3, 1),
+                 A vertex at (1/3, 1, 2/3),
+                 A vertex at (1/3, 1, 1),
+                 A vertex at (1, 1/3, 2/3),
+                 A vertex at (1, 1/3, 1),
+                 A vertex at (1, 1, 2/3))
+            '''
+            if lower_left == upper_right:
+                return self.bucket_to_hypercube(lower_left)
+            edges = self.edges_of_selection(lower_left, upper_right)
+            # note: upper_right is the bucket that is hased with
+            # the actual lower left vertex of the bucket
+            # therefore, to get the actual upper right vertex of the selection
+            # all coordinates of the upper right bucket needed to add one
+            new_upper_right = tuple(c + 1 for c in upper_right)
+            v = set([lower_left, new_upper_right])
+            for i in range(self.dim()):
+                up = self.change_coordinate(lower_left, i, edges[i]+1)
+                down = self.change_coordinate(new_upper_right, i, -edges[i]-1)
+                v.add(up)
+                v.add(down)
+            vertices = [self.get_coordinate(p) for p in list(v)]
+            return Polyhedron(vertices=vertices)
+ 
+        def point_in_bucket(self, point):
+
+            return tuple(((p) // (self._width)).floor() if p != 1
+                        else self._size - 1
+                        for p in point)
 
         def width(self):
             return self._width
 
         def size(self):
             return self._size
-
-        def standard_grid(self):
-            r"""
-            Return the vertices representation of the standard grid
-            which is a hypercube with the origin at 0 and each edge
-            has length 1
-
-            EXAMPLES::
-
-                sage: g = Grid(2, 3)
-                sage: g.standard_grid()
-                [[0, 0, 0],
-                 [0, 0, 1],
-                 [0, 1, 0],
-                 [0, 1, 1],
-                 [1, 0, 0],
-                 [1, 0, 1],
-                 [1, 1, 0],
-                 [1, 1, 1]]
-            """
-            origin = [0 for i in range(self.dimension())]
-            return self.build_grid(origin, 1)
-
-        def standard_grid_polyhedron(self):
-            r"""
-            Return the standard grid which is a hypercube with
-            the origin at 0 and each edge has length 1
-
-            EXAMPLES::
-
-                sage: g = Grid(1, 3)
-                sage: p = g.standard_grid_polyhedron()
-                sage: p.vertices()
-                (A vertex at (0, 0, 0),
-                 A vertex at (0, 0, 1),
-                 A vertex at (0, 1, 0),
-                 A vertex at (0, 1, 1),
-                 A vertex at (1, 0, 0),
-                 A vertex at (1, 0, 1),
-                 A vertex at (1, 1, 0),
-                 A vertex at (1, 1, 1))
-            """
-            return Polyhedron(vertices=self.standard_grid())
 
 
 
