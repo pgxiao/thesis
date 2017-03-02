@@ -1,11 +1,11 @@
-# FIXME: search, iteration should be equal to k dim times, not just 1
 # TODO: add, remove polyhedral
-# TODO: buckets search
+# 
 
 if '' not in sys.path:
     sys.path = [''] + sys.path
 from igp import *
 from sage.numerical.mip import MIPSolverException
+from sage.misc.all import cached_method
 from collections import defaultdict
 from itertools import product
 
@@ -14,9 +14,36 @@ from itertools import product
 # Polyhedral Arrangement
 ###############################
 
-class PolyhedralArrangement:
+class PolyhedralArrangement(object):
     """
     Define a Polyhedral Arrangement.
+
+    INPUT:
+
+    - ``colletion`` -- either a list or a tuple of polyhedra, or a dictionary of polyhedra
+      where the keys are the dimension of the polyhedra
+
+    Attributes:
+
+    - ``ambient_dim`` -- the ambient dim of each polyhedron
+        
+    - ``dim`` -- the maximal dimension among the polyhedra
+        
+    - ``size`` -- the numbers of polyhedra (not including sub-polyhedra)
+      when set up the arrangement
+    
+    - ``grid`` -- a :class:`Grid` that can be used for discrete binary search
+      on polyhedra
+        
+    - ``collection`` -- a dictionary of the polyhedra (not including sub-polyhedra)
+      where the keys are the dimension of the polyhedra
+        
+    - ``grid_contents`` -- a dictionary of the ``grid``, the keys are buckets
+      and the values are a set of polyhedra that intersect with the key
+        
+    - ``buckets`` -- a dictionary, the keys are polyhedra and the values are the
+      buckets that intersect with the key (this attribute is like a dual
+      of ``grid_contents``)
 
     EXAMPLES::
 
@@ -42,22 +69,34 @@ class PolyhedralArrangement:
             return
         self._ambient_dim = coll_dict.values()[0][0].ambient_dim()
         self._dim = max(coll_dict.keys())
-        # size is the numbers of polyhedra (not including sub-polyhedra) when set up the arrangement
         self._size = sum([len(v) for v in coll_dict.values()])
-        self._coll_dict = coll_dict
         self._grid = Grid(self._size, self._ambient_dim, width=None)
+        self._collection = coll_dict
+        self._grid_contents = self._grid._contents
         self._buckets = defaultdict(set)
 
+    def __iter__(self):
+        for polyhedron in self.collection_of_polyhedra():
+            yield polyhedron
+
     def ambient_dimension(self):
+        r"""
+        The ambient dim of each polyhedron.
+        """
         return self._ambient_dim
 
     def buckets(self):
+        r"""
+        A dictionary, the keys are polyhedra and the values are the
+        buckets that intersect with the key (this attribute is like a dual
+        of ``grid_contents``).
+        """
         return self._buckets
 
-    def collection(self):
+    def collection_of_polyhedra(self):
         r"""
-        Return a set of polyhedra in the collection
-        (only include the maximal ones)
+        A dictionary of the polyhedra (not including sub-polyhedra)
+        where the keys are the dimension of the polyhedra.
         """
         c = set()
         coll_dict = self.collection_dict()
@@ -67,19 +106,31 @@ class PolyhedralArrangement:
         return c
 
     def collection_dict(self):
-        return self._coll_dict
+        r"""
+        A dictionary of the polyhedra (not including sub-polyhedra)
+        where the keys are the dimension of the polyhedra.
+        """
+        return self._collection
 
     def dim(self):
         r"""
-        Return highest dimension of the polyhedra
+        The maximal dimension among the polyhedra.
         """
         return self._dim
 
     def grid(self):
+        r"""
+        A :class:``Grid`` that can be used for discrete binary search
+        on polyhedra.
+        """
         return self._grid
 
-    def grid_dict(self):
-        return self.grid().dict()
+    def grid_contents(self):
+        r"""
+        A dictionary of the ``grid``, the keys are buckets and the
+        values are a set of polyhedra that intersect with the key.
+        """
+        return self._grid_contents
 
     def LP_for_intersection(self, p, q):
         r"""
@@ -120,6 +171,7 @@ class PolyhedralArrangement:
         if dim(p) == -1 or dim(q) == -1:
             raise ValueError("Cannot intersect with empty polyhedron")
 
+        # QUESTION: what solver should I use
         lp = MixedIntegerLinearProgram(solver='GLPK')
         x = lp.new_variable()
         lp.set_objective(0)
@@ -137,6 +189,7 @@ class PolyhedralArrangement:
 
         eqns = p.equations_list() + q.equations_list()
         ieqs = p.inequalities_list() + q.inequalities_list()
+        # FIXME: (suggestion by Yuan) might use to_linear_program create LPs and inequalities
         for eqn in eqns:
             f = linear_constraint(eqn, "==")
             lp.add_constraint(f)
@@ -188,177 +241,375 @@ class PolyhedralArrangement:
             print "Unexpected error"
             raise
 
+    def point_lookup(self, point):
+        r"""
+        Given a point, find where the bucket that the point belong to,
+        and return the contents on that bucket as a set.
+
+        EXAMPLES::
+
+            sage: p = Polyhedron(vertices=[[8/21, 1/4], [4/5, 1/5], [5/6, 4/5]])
+            sage: q = Polyhedron(vertices=[[1/2, 1/2], [5/6, 1/2], [1/2, 1]])
+            sage: x = Polyhedron(vertices=[[4/5, 4/5]])
+            sage: pa = PolyhedralArrangement([p, q, x])
+            sage: pa.point_lookup(x)
+            {A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices,
+             A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices,
+             A 0-dimensional polyhedron in QQ^2 defined as the convex hull of 1 vertex}
+        """
+        self.update_dictionaries()
+        grid = self.grid()
+        point = point.vertices_list()[0]
+        bucket = grid.point_in_bucket(point)
+        return self.grid_contents()[bucket]
+
     def size(self):
         r"""
-        Return the size of the original collection of polyhedra
+        Return the size of the original collection of polyhedra.
         """
         return self._size
 
-    def search_polyhedron(self, p, selection=None):
+    @cached_method
+    def update_dictionaries_for_a_polyhedron(self, p, selection=None):
         r"""
-        Search what buckets the polyhedron ``p`` located in
-        and update the bucket dictionary.
+        Use binary search to find what buckets the polyhedron ``p``
+        located in and update two dictionaries: ``grid_contents`` and
+        ``buckets``.
+
+        Recall:
+
+        - ``grid_contents`` -- a dictionary of the ``grid``, the keys are buckets
+          and the values are a set of polyhedra that intersect with the key
+            
+        - ``buckets`` -- a dictionary, the keys are polyhedra and the values are the
+          buckets that intersect with the key (this attribute is like a dual
+          of ``grid_contents``)
+
+        INPUT:
+
+        - ``p`` -- a :class:`Polyhedron`
+
+        - ``selection`` -- (default: None) a tuple of two buckets
+          (buckets are represented by its integer coordinates,
+          see :class:`Grid` for examples)
+          if ``selection`` is None, then choose the entire grid as
+          selection
+
+        EXAMPLES::
+
+            sage: p = Polyhedron(vertices=[[8/21, 1/4], [4/5, 1/5], [5/6, 4/5]])
+            sage: q = Polyhedron(vertices=[[1/2, 1/2], [4/5, 1/2], [1/2, 5/6]])
+            sage: x = Polyhedron(vertices=[[4/5, 4/5]])
+            sage: pa = PolyhedralArrangement([p, q, x])
+            sage: pa.update_dictionaries_for_a_polyhedron(p)
+            sage: pa.grid_contents()
+            defaultdict(<type 'set'>, {(2, 0): set([A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices]), (1, 0): set([A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices]), (1, 1): set([A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices]), (2, 1): set([A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices]), (2, 2): set([A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices])})
+            sage: pa.buckets()
+            defaultdict(<type 'set'>, {A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices: set([(2, 0), (1, 0), (1, 1), (2, 1), (2, 2)])})
         """
         grid = self.grid()
         if selection is None:
             size = grid.size()
             dim = grid.dim()
             selection = (tuple(0 for i in range(dim)), tuple(size - 1 for i in range(dim)))
-        print "searching selection", selection
         lower_left = selection[0]
         upper_right = selection[1]
         if self.LP_intersect(grid.selection_to_polyhedron(lower_left, upper_right), p):
-            print "intersect"
-            print "lower_left", lower_left
-            print "upper_right", upper_right
             if lower_left == upper_right:
                 grid._contents[lower_left].add(p)
                 self._buckets[p].add(lower_left)
             else:
-                print "lower_left != upper_right"
                 a, b = grid.cut_selection(lower_left, upper_right)
-                self.search_polyhedron(p, a)
-                self.search_polyhedron(p, b)
+                self.update_dictionaries_for_a_polyhedron(p, a)
+                self.update_dictionaries_for_a_polyhedron(p, b)
 
-    def search(self, selection=None):
+    @cached_method
+    def update_dictionaries(self, selection=None):
         r"""
-        For each polyhedron in the collection, search which grid does
-        the polyhedron located in and update the grid dictionary.
+        For each polyhedron in the collection, use binary search to 
+        find what buckets the polyhedron located in and update two
+        dictionaries: ``bucket`` and ``grid_contents``.
+
+        See :meth:`update_dictionaries_for_a_polyhedron` for more
+        docstrings.
+
+        EXAMPLES::
+
+            sage: p = Polyhedron(vertices=[[8/21, 1/4], [4/5, 1/5], [5/6, 4/5]])
+            sage: q = Polyhedron(vertices=[[1/2, 1/2], [5/6, 1/2], [1/2, 1]])
+            sage: x = Polyhedron(vertices=[[4/5, 4/5]])
+            sage: pa = PolyhedralArrangement([p, q, x])
+            sage: pa.update_dictionaries()
+            sage: pa.grid_contents()
+            defaultdict(<type 'set'>, {(1, 2): set([A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices]), (2, 1): set([A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices, A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices]), (2, 0): set([A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices]), (2, 2): set([A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices, A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices, A 0-dimensional polyhedron in QQ^2 defined as the convex hull of 1 vertex]), (1, 0): set([A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices]), (1, 1): set([A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices, A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices])})
+            sage: pa.buckets()
+            defaultdict(<type 'set'>, {A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices: set([(2, 0), (1, 0), (1, 1), (2, 1), (2, 2)]), A 2-dimensional polyhedron in QQ^2 defined as the convex hull of 3 vertices: set([(1, 2), (1, 1), (2, 1), (2, 2)]), A 0-dimensional polyhedron in QQ^2 defined as the convex hull of 1 vertex: set([(2, 2)])})
         """
-        for p in self.collection():
-            self.search_polyhedron(p, selection)
+        for p in self.collection_of_polyhedra():
+            self.update_dictionaries_for_a_polyhedron(p, selection)
 
-class Grid:
-        """docstring for Grid"""
-        def __init__(self, number_of_poly, dim, width=None):
-            # size is the number of polyhedra
-            # dim is the ambient dimension of the polyhedra
-            # FIXME: width can only be fractional
-            if width is None:
-                # self._width = 1 / (size ^ (1 / dim))
-                self._width = 1 / number_of_poly
-                # FIXME: check width types, raise error if not fractional
-            self._size = int(1 / self._width)
-            self._dim = dim
-            self._coord = [i * self._width for i in range(0, 1 + self._size)]
-            self._buckets = set(product(range(self._size), repeat=dim))
-            self._contents = defaultdict(set)
+class Grid(object):
+    r"""
+    Define a grid that are divided into buckets. The grid
+    will be used for discrete binary search to find polyhedra
+    intersection in :class:`PolyhedralArrangement`.
 
-        # definition of terms:
-        # 1. bucket - a single bucket in the grid with integer coordinates.
-        # 2. selection - a bounch of buckets which can be determined by 
-        #    the lower left bucket and upper right bucket.
-        #    Think of a cube that can be determined by the lower left vertex
-        #    and upper right vertex.
+    # definition of terms:
+    # 1. bucket - a single bucket in the grid with integer coordinates.
+    # 2. selection - a bounch of buckets which can be determined by 
+    #    the lower left bucket and upper right bucket.
+    #    Think of a cube that can be determined by the lower left vertex
+    #    and upper right vertex.
 
-        def buckets(self):
-            return self._buckets
+    INPUT:
 
-        def bucket_to_hypercube(self, lower_left):
-            r"""
-            Return a hypercube with standard width by giving the actual coordinates
-            of the lower left vertex of hypercube.
-            """
-            origin = self.get_coordinate(lower_left)
-            unit_grid_iter = product([0, self.width()], repeat=self.dim())
-            unit_grid = [list(v) for v in unit_grid_iter]
-            v_list = [0] * len(unit_grid)
-            for index, v in enumerate(unit_grid):
-                v_list[index] = [o + p for o, p in zip(v, origin)]
-            return Polyhedron(vertices=v_list)
+    - ``number_of_poly`` -- an integer, the number of polyhedra
+      in the colletion in a :class:`PolyhedralArrangement`
 
-        def change_coordinate(self, bucket, index, change):
-            # change one coordinate of the given bucket
-            return bucket[:index] + (bucket[index] + change,) + bucket[1 + index:]
+    - ``dim`` -- the dimension of the grid
 
-        def cut_selection(self, lower_left, upper_right):
-            r"""
-            Given the lower left vertice and upper right vertice of the selection,
-            find the 'longest' part, and cut it into two equal parts.
+    - ``width`` -- the width of the bucket
 
-            Return two tuples of the lower left and upper right vertices
-            of the two buckets.
-            """
-            if lower_left == upper_right:
-                return lower_left, lower_left
-            index, length = self.longest_edge(lower_left, upper_right)
-            change = (length + 1) // 2
-            if length % 2 == 0:
-                # odd number of buckets
-                upper_change = change + 1
-            else:
-                upper_change = change
-            # cut the bucket into two buckets
-            # assume the lower one is smaller if length is odd
-            small = (lower_left, self.change_coordinate(upper_right, index, -upper_change))
-            large = (self.change_coordinate(lower_left, index, change), upper_right)
-            return small, large
+    Attributes:
 
-        def dim(self):
-            return self._dim
+    - ``width`` -- the width of each bucket
 
-        def dict(self):
-            return self._contents
+    - ``size`` -- an integer that indicates how many pieces
+      are divided from 0 to 1
 
-        def edges_of_selection(self, lower_left, upper_right):
-            return [c1 - c0 for c0, c1 in zip(lower_left, upper_right)]
+    - ``dim`` -- an integer that indicates the dimension
+      of the grid
 
-        def get_coordinate(self, bucket):
-            # get the actual coordinate of the bucket
-            return tuple(coord * self.width() for coord in bucket)
+    - ``buckets`` -- a set that includes all the buckets
+      in the grid
 
-        def longest_edge(self, lower_left, upper_right):
-            edges = self.edges_of_selection(lower_left, upper_right)
-            m = max(edges)
-            index = edges.index(m)
-            return index, m
+    - ``contents`` -- a dictionary, the keys are buckets
+      and the values are the contents on the buckets. In
+      this codes (so far), the contents are sets of polyhedra
+      that intersect with the keys
+    """ 
+    def __init__(self, number_of_poly, dim, width=None):
+        # size is the number of polyhedra
+        # dim is the ambient dimension of the polyhedra
+        # FIXME: width can only be fractional
+        if width is None:
+            # self._width = 1 / (sizre ^ (1 / dim))
+            self._width = 1 / number_of_poly
+        self._size = int(1 / self._width)
+        self._dim = dim
+        self._buckets = set(product(range(self._size), repeat=dim))
+        self._contents = defaultdict(set)
 
-        def selection_to_polyhedron(self, lower_left, upper_right):
-            r'''
-            EXAMPLES::
+    def buckets(self):
+        r"""
+        Return a set that includes all the buckets in the grid
 
-                sage: g = Grid(3, 3)
-                sage: # build a flat box 
-                sage: # (i.e. the height is half of the width or of the length)
-                sage: p = g.selection_to_polyhedron((1, 1, 2), (2, 2, 2))
-                sage: p.vertices()
-                (A vertex at (1, 1, 1),
-                 A vertex at (1/3, 1/3, 2/3),
-                 A vertex at (1/3, 1/3, 1),
-                 A vertex at (1/3, 1, 2/3),
-                 A vertex at (1/3, 1, 1),
-                 A vertex at (1, 1/3, 2/3),
-                 A vertex at (1, 1/3, 1),
-                 A vertex at (1, 1, 2/3))
-            '''
-            if lower_left == upper_right:
-                return self.bucket_to_hypercube(lower_left)
-            edges = self.edges_of_selection(lower_left, upper_right)
-            # note: upper_right is the bucket that is hased with
-            # the actual lower left vertex of the bucket
-            # therefore, to get the actual upper right vertex of the selection
-            # all coordinates of the upper right bucket needed to add one
-            new_upper_right = tuple(c + 1 for c in upper_right)
-            v = set([lower_left, new_upper_right])
-            for i in range(self.dim()):
-                up = self.change_coordinate(lower_left, i, edges[i]+1)
-                down = self.change_coordinate(new_upper_right, i, -edges[i]-1)
-                v.add(up)
-                v.add(down)
-            vertices = [self.get_coordinate(p) for p in list(v)]
-            return Polyhedron(vertices=vertices)
- 
-        def point_in_bucket(self, point):
 
-            return tuple(((p) // (self._width)).floor() if p != 1
-                        else self._size - 1
-                        for p in point)
+        EXAMPLES::
 
-        def width(self):
-            return self._width
+            sage: g = Grid(3, 2)
+            sage: g.buckets()
+            {(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2)}
+        """
+        return self._buckets
 
-        def size(self):
-            return self._size
+    def bucket_to_hypercube(self, lower_left):
+        r"""
+        Return a hypercube in standard width by giving the coordinates
+        of the lower left bucket.
+
+        EXAMPLES::
+
+            sage: g = Grid(3, 3)
+            sage: g.bucket_to_hypercube((0, 0, 0)).vertices()
+            (A vertex at (0, 0, 0),
+             A vertex at (0, 0, 1/3),
+             A vertex at (0, 1/3, 0),
+             A vertex at (0, 1/3, 1/3),
+             A vertex at (1/3, 0, 0),
+             A vertex at (1/3, 0, 1/3),
+             A vertex at (1/3, 1/3, 0),
+             A vertex at (1/3, 1/3, 1/3))
+        """
+        origin = self.get_coordinate(lower_left)
+        unit_grid_iter = product([0, self.width()], repeat=self.dim())
+        unit_grid = [list(v) for v in unit_grid_iter]
+        v_list = [0] * len(unit_grid)
+        for index, v in enumerate(unit_grid):
+            v_list[index] = [o + p for o, p in zip(v, origin)]
+        return Polyhedron(vertices=v_list)
+
+    def change_coordinate(self, bucket, index, change):
+        r"""
+        Change one coordinate of the given bucket.
+
+        EXAMPLES::
+
+            sage: g = Grid(3, 3)
+            sage: g.change_coordinate((0, 1, 2), 2, -1)
+            (0, 1, 1)
+        """
+        return bucket[:index] + (bucket[index] + change,) + bucket[1 + index:]
+
+    def contents(self):
+        r"""
+        A dictionary, the keys are buckets and the values are the contents
+        on the buckets. In this codes (so far), the contents are sets of
+        polyhedra that intersect with the keys.
+        """
+        return self._contents
+
+    def cut_selection(self, lower_left, upper_right):
+        r"""
+        Given the lower left bucket and upper right bucket of the selection,
+        find the 'longest' edges, and cut it into two new selections.
+
+        If all edges are equal, cut the selection from its first coordinate.
+
+        Return two selections with their lower left and upper right buckets.
+
+        EXAMPLES::
+
+            sage: g = Grid(3, 3)
+            sage: g.cut_selection((0, 0, 0), (2, 2, 2))
+            (((0, 0, 0), (0, 2, 2)), ((1, 0, 0), (2, 2, 2)))
+            sage: g.cut_selection((1, 1, 1), (1, 1, 1))
+            ((1, 1, 1), (1, 1, 1))
+        """
+        if lower_left == upper_right:
+            return lower_left, lower_left
+        index, length = self.longest_edge(lower_left, upper_right)
+        change = (length + 1) // 2
+        if length % 2 == 0:
+            # odd number of buckets
+            upper_change = change + 1
+        else:
+            upper_change = change
+        # cut the selection into two new selection
+        # assume the lower left selection is smaller if length is odd
+        small = (lower_left, self.change_coordinate(upper_right, index, -upper_change))
+        large = (self.change_coordinate(lower_left, index, change), upper_right)
+        return small, large
+
+    def dim(self):
+        r"""
+        Return the dimension of the grid.
+        """
+        return self._dim
+
+    def edges_of_selection(self, lower_left, upper_right):
+        r"""
+        Return the lengths of the edges of the selection.
+
+        EXAMPLES::
+
+            sage: g = Grid(3, 3)
+            sage: g.edges_of_selection((0, 1, 1), (1, 2, 1))
+            [1, 1, 0]
+        """
+        return [c1 - c0 for c0, c1 in zip(lower_left, upper_right)]
+
+    def get_coordinate(self, bucket):
+        r"""
+        Get the actual coordinate of the bucket.
+
+        EXAMPLES::
+
+            sage: g = Grid(3, 3)
+            sage: g.get_coordinate((0, 1, 2))
+            (0, 1/3, 2/3)
+        """
+        return tuple(coord * self.width() for coord in bucket)
+
+    def longest_edge(self, lower_left, upper_right):
+        r"""
+        Find the longest edge of a selection.
+
+        EXAMPLES::
+
+            sage: g = Grid(3, 3)
+            sage: g.longest_edge((0, 1, 1), (1, 2, 1))
+            (0, 1)
+        """
+        edges = self.edges_of_selection(lower_left, upper_right)
+        m = max(edges)
+        index = edges.index(m)
+        return index, m
+
+    def selection_to_polyhedron(self, lower_left, upper_right):
+        r'''
+        Convert a selection to a polyhedron.
+
+        EXAMPLES::
+
+            sage: g = Grid(3, 3)
+            sage: # build a flat box 
+            sage: # (i.e. the height is half of the width or of the length)
+            sage: p = g.selection_to_polyhedron((1, 1, 2), (2, 2, 2))
+            sage: p.vertices()
+            (A vertex at (1, 1, 1),
+             A vertex at (1/3, 1/3, 2/3),
+             A vertex at (1/3, 1/3, 1),
+             A vertex at (1/3, 1, 2/3),
+             A vertex at (1/3, 1, 1),
+             A vertex at (1, 1/3, 2/3),
+             A vertex at (1, 1/3, 1),
+             A vertex at (1, 1, 2/3))
+        '''
+        if lower_left == upper_right:
+            return self.bucket_to_hypercube(lower_left)
+        edges = self.edges_of_selection(lower_left, upper_right)
+        # note: upper_right is the bucket that is hased with
+        # the actual lower left vertex of the bucket
+        # therefore, to get the actual upper right vertex of the selection
+        # all coordinates of the upper right bucket needed to add one
+        new_upper_right = tuple(c + 1 for c in upper_right)
+        v = set([lower_left, new_upper_right])
+        for i in range(self.dim()):
+            up = self.change_coordinate(lower_left, i, edges[i]+1)
+            down = self.change_coordinate(new_upper_right, i, -edges[i]-1)
+            v.add(up)
+            v.add(down)
+        vertices = [self.get_coordinate(p) for p in list(v)]
+        return Polyhedron(vertices=vertices)
+
+    def point_in_bucket(self, point):
+        r"""
+        Return a bucket where the point are located in.
+
+        EXAMPLES:
+
+            sage: g = Grid(3, 3)
+            sage: g.point_in_bucket((1/4, 1/2, 1))
+            (0, 1, 2)
+        """
+        return tuple(((p) // (self._width)).floor() if p != 1
+                    else self._size - 1
+                    for p in point)
+
+    def width(self):
+        r"""
+        Return the width of the grid.
+
+        EXAMPLES::
+
+            sage: g = Grid(2, 3)
+            sage: g.width()
+            1/2
+        """
+        return self._width
+
+    def size(self):
+        r"""
+        Return the size of the grid.
+
+        EXAMPLES::
+
+            sage: g = Grid(2, 3)
+            sage: g.size()
+            2
+        """
+        return self._size
 
 
 
