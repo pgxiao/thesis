@@ -6,6 +6,60 @@ from sage.misc.all import cached_method
 from collections import defaultdict
 from itertools import product
 
+def construct_2d_strip_by_FastPiecewise(f):
+    """
+    （Credit by Shuidie Yao)
+    Take a FastPiecewise function, convert it to straight 2d.
+    Points are extended to lines, intervals are converted to rectangles
+    
+    EXAMPLES::
+    
+        sage: logging.disable(logging.INFO)
+        sage: h = gmic()
+        sage: for p in construct_2d_strip_by_FastPiecewise(h):
+        ....:     p.vertices()
+        (A vertex at (4/5, 0), A vertex at (4/5, 1))
+        (A vertex at (1, 0),
+         A vertex at (1, 1),
+         A vertex at (4/5, 0),
+         A vertex at (4/5, 1))
+        (A vertex at (0, 0),
+         A vertex at (0, 1),
+         A vertex at (4/5, 0),
+         A vertex at (4/5, 1))
+        (A vertex at (0, 0), A vertex at (0, 1))
+        (A vertex at (1, 0), A vertex at (1, 1))
+    """
+    polyhedra = set([Polyhedron(vertices = [[intv[0],0],[intv[1],0],[intv[0],1],[intv[1],1]]) for intv in f.intervals()])
+    for intv in f.intervals():
+        if len(intv) == 2:
+            polyhedra.add(Polyhedron(vertices = [[intv[0],0],[intv[0],1]]))
+            polyhedra.add(Polyhedron(vertices = [[intv[1],0],[intv[1],1]]))
+        else:
+            if intv[0] != intv[1] and intv.left_closed:
+                polyhedra.add(Polyhedron(vertices = [[intv[0],0],[intv[0],1]]))
+            if intv[0] != intv[1] and intv.right_closed:
+                polyhedra.add(Polyhedron(vertices = [[intv[1],0],[intv[1],1]]))
+    return polyhedra
+
+def ideal_width(number_of_polyhedra, dim, constant=1, convergent_index=20):
+    # FIXME: under experiment
+    # Koeppe's comments on width:
+    # 1) In the end, only computational experiment can determine what is the
+    # most efficient choice of width.
+    # 2) For small objects (like points), one would expect something like
+    # constant * 1 / (number_of_polyhedra ^ (1 / dim)) (currently commented-out) 
+    # to be best. Again, only computational experiments can determine what
+    # constant to use.
+    # 3) constant * 1 / (number_of_polyhedra ^ (1 / dim)) is irrational and
+    # thus can't use it directly. So one needs to round it so that its
+    # reciprocal is an integer.
+    width = constant * 1 / (number_of_polyhedra ^ (1 / dim))
+    cf = continued_fraction(1 / (number_of_polyhedra ^ (1 / dim)))
+    cf_conv = cf.convergent(convergent_index)
+    d = cf_conv.denominator()
+    n = cf_conv.numerator()
+    return 1 / ceil(d / n)
 
 ###############################
 # Polyhedral Arrangement
@@ -17,7 +71,8 @@ class PolyhedralArrangement(object):
 
     INPUT:
 
-    - ``collection`` -- either a list or a tuple of polyhedra, or a dictionary of polyhedra.
+    - ``collection`` -- either a list or a tuple or a set of polyhedra, 
+    or a dictionary of polyhedra.
     The keys of the dictionary are the dimensions of the polyhedra
 
     Attributes:
@@ -50,8 +105,8 @@ class PolyhedralArrangement(object):
         sage: collection = (p, q)
         sage: PA = PolyhedralArrangement(collection)
     """
-    def __init__(self, collection):
-        if isinstance(collection, (list, tuple)):
+    def __init__(self, collection, bucket_width=None):
+        if isinstance(collection, (list, tuple, set)):
             coll_dict = {}
             for p in collection:
                 d = p.dim()
@@ -68,7 +123,7 @@ class PolyhedralArrangement(object):
         self._ambient_dim = coll_dict.values()[0][0].ambient_dim()
         self._dim = max(coll_dict.keys())
         self._number_of_polyhedra = sum([len(v) for v in coll_dict.values()])
-        self._grid = Grid(self._number_of_polyhedra, self._ambient_dim)
+        self._grid = Grid(self._number_of_polyhedra, self._ambient_dim, bucket_width=bucket_width)
         self._collection = coll_dict
         self._grid_contents = self._grid._contents
         self._polyhedron_buckets = defaultdict(set)
@@ -89,19 +144,19 @@ class PolyhedralArrangement(object):
         the key is a list of buckets (each bucket is presented
         as a values set) that intersect with the polyhedron.
         """
+        self.update_dictionaries()
         return self._polyhedron_buckets
 
     def collection_of_polyhedra(self):
         r"""
-        A dictionary of the polyhedra (not including sub-polyhedra).
-        The keys of the dictionary are the dimensions of the polyhedra.
+        A list of polyhedra from the collection.
         """
         collection = set()
         coll_dict = self.collection_dict()
         for polyhedra_list in coll_dict.values():
             for polyhedron in polyhedra_list:
                 collection.add(polyhedron)
-        return collection
+        return list(collection)
 
     def collection_dict(self):
         r"""
@@ -128,7 +183,61 @@ class PolyhedralArrangement(object):
         A dictionary of the ``grid``, the keys are buckets and the
         values are a set of polyhedra that intersect with the key.
         """
+        self.update_dictionaries()
         return self._grid_contents
+
+    def intersect(self, p, q):
+        r"""
+        Use binary search to check if two polyhedra ``p`` and ``q``
+        intersect. Return True if they intersect, else return False.
+        """
+        p_buckets = self.in_buckets(p)
+        q_buckets = self.in_buckets(q)
+        if p_buckets.intersection(q_buckets) == set():
+            return False
+        if self.check_intersect_by_linear_programming(p, q):
+            return True
+        else:
+            return False
+
+    def in_buckets(self, p):
+        r"""
+        Return the sets of buckets that the polyhedron ``p`` locates
+        in.
+
+        EXAMPLES::
+
+            sage: p = Polyhedron(vertices=[[8/21, 1/4], [4/5, 1/5], [5/6, 4/5]])
+            sage: q = Polyhedron(vertices=[[1/2, 1/2], [5/6, 1/2], [1/2, 1]])
+            sage: x = Polyhedron(vertices=[[4/5, 4/5]])
+            sage: pa = PolyhedralArrangement([p, q, x])
+            sage: pa.in_buckets(p)
+            {(1, 0), (1, 1), (2, 0), (2, 1), (2, 2)}
+
+            sage: poly = construct_2d_strip_by_FastPiecewise(h)
+            sage: pa = PolyhedralArrangement(poly, bucket_width="ideal")
+            sage: collection = pa.collection_of_polyhedra()
+            sage: for p in collection:
+            ....:         p.vertices()
+            ....:         pa.in_buckets(p)
+            (A vertex at (0, 0), A vertex at (0, 1))
+            {(0, 0), (0, 1), (0, 2)}
+            (A vertex at (0, 0),
+             A vertex at (0, 1),
+             A vertex at (4/5, 0),
+             A vertex at (4/5, 1))
+            {(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0), (2, 1), (2, 2)}
+            (A vertex at (1, 0),
+             A vertex at (1, 1),
+             A vertex at (4/5, 0),
+             A vertex at (4/5, 1))
+            {(2, 0), (2, 1), (2, 2)}
+            (A vertex at (4/5, 0), A vertex at (4/5, 1))
+            {(2, 0), (2, 1), (2, 2)}
+            (A vertex at (1, 0), A vertex at (1, 1))
+            {(2, 0), (2, 1), (2, 2)}
+        """
+        return self.polyhedron_buckets()[p]
 
     def construct_linear_programming_for_intersection(self, p, q):
         r"""
@@ -169,8 +278,7 @@ class PolyhedralArrangement(object):
         if dim(p) == -1 or dim(q) == -1:
             raise ValueError("Cannot intersect with empty polyhedron")
 
-        # QUESTION: what solver should I use
-        lp = MixedIntegerLinearProgram(solver='GLPK')
+        lp = MixedIntegerLinearProgram()
         x = lp.new_variable()
         lp.set_objective(0)
 
@@ -259,6 +367,52 @@ class PolyhedralArrangement(object):
         point = point.vertices_list()[0]
         bucket = self.grid().point_in_bucket(point)
         return self.grid_contents()[bucket]
+
+    def point_in_polyhedra(self, point):
+        r"""
+        (Required by Shuidie)
+        Find which polyhedra the point locates on.
+        Return a list of those polyhedra.
+
+        EXAMPLES::
+
+            sage: h1 = gmic()
+            INFO: 2017-03-08 15:54:49,336 Rational case.
+            sage: poly = construct_2d_strip_by_FastPiecewise(h1)
+            sage: pa = PolyhedralArrangement(poly, bucket_width="ideal")
+            sage: point = (4/5, 1)
+            sage: intersect_poly = pa.point_in_polyhedra(point)
+            sage: for p in intersect_poly:
+            ....:         p.vertices()
+            (A vertex at (1, 0),
+             A vertex at (1, 1),
+             A vertex at (4/5, 0),
+             A vertex at (4/5, 1))
+            (A vertex at (0, 0),
+             A vertex at (0, 1),
+             A vertex at (4/5, 0),
+             A vertex at (4/5, 1))
+            (A vertex at (4/5, 0), A vertex at (4/5, 1))
+            sage: h2 = rlm_dpl1_extreme_3a()
+            INFO: 2017-03-08 15:57:04,237 Rational case.
+            sage: poly = construct_2d_strip_by_FastPiecewise(h2)
+            sage: pa = PolyhedralArrangement(poly, bucket_width="ideal")
+            sage: point = (5/8, 1/2)
+            sage: intersect_poly = pa.point_in_polyhedra(point)
+            sage: for p in intersect_poly:
+            ....:         p.vertices()
+            (A vertex at (1, 0),
+             A vertex at (1, 1),
+             A vertex at (5/8, 0),
+             A vertex at (5/8, 1))
+            (A vertex at (1/4, 0),
+             A vertex at (1/4, 1),
+             A vertex at (5/8, 0),
+             A vertex at (5/8, 1))
+            (A vertex at (5/8, 0), A vertex at (5/8, 1))
+        """
+        possible_intersect = self.point_lookup(Polyhedron(vertices=[point]))
+        return [p for p in possible_intersect if p.contains(point)]
 
     def number_of_polyhedra(self):
         r"""
@@ -389,9 +543,13 @@ class Grid(object):
         # dim is the ambient dimension of the polyhedra
         # FIXME: width can only be fractional
         if bucket_width is None:
-            # self._bucket_width = 1 / (sizre ^ (1 / dim))
+            # self._bucket_width = 1 / (number_of_polyhedra ^ (1 / dim))
             self._bucket_width = 1 / number_of_polyhedra
-        self._size = int(1 / self._bucket_width)
+        elif bucket_width == "ideal":
+            self._bucket_width = ideal_width(number_of_polyhedra, dim)
+        else:
+            print "Unknown bucket_width option"
+        self._size = Integer(1 / self._bucket_width)
         self._dim = dim
         self._contents = defaultdict(set)
 
